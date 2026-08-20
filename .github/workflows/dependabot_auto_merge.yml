@@ -1,0 +1,63 @@
+# =============================================================================
+# VULNERABLE WORKFLOW — Mirrors Shopify/shopify-app-js
+# =============================================================================
+# BUG: Uses pull_request_target (secrets available!) + checks out PR head code
+#      via ref: github.head_ref, then EXECUTES a shell script from that
+#      checked-out code. The only guard is checking the PR author is
+#      dependabot[bot], which can be bypassed via Confused Deputy attack.
+#
+# KEY DIFFERENCE vs Finding 01:
+#   - pull_request_target = secrets ARE available (even for fork PRs)
+#   - SHOPIFY_GH_ACCESS_TOKEN = elevated PAT with write access
+#   - The shell script is executed FROM the checked-out PR code
+# =============================================================================
+
+name: Dependabot auto-merge
+on: pull_request_target
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  dependabot:
+    runs-on: ubuntu-latest
+    # Guard: only run for dependabot PRs — but this is bypassable!
+    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: '${{ secrets.SHOPIFY_GH_ACCESS_TOKEN }}'
+
+      # =====================================================================
+      # VULNERABILITY: checkout PR head code with elevated token
+      # pull_request_target runs in base context → secrets available
+      # ref: github.head_ref → checks out attacker-controlled code
+      # =====================================================================
+      - name: Checkout (not dev dep)
+        uses: actions/checkout@v4
+        if: ${{ steps.metadata.outputs.update-type != 'version-update:semver-major' && steps.metadata.outputs.dependency-type != 'direct:development' }}
+        with:
+          fetch-depth: 2
+          ref: ${{ github.head_ref }}                        # ← PR branch (attacker-controlled)
+          token: ${{ secrets.SHOPIFY_GH_ACCESS_TOKEN }}      # ← elevated PAT
+
+      # =====================================================================
+      # VULNERABILITY: executes shell script FROM the checked-out PR code
+      # The attacker can modify this script in their branch
+      # =====================================================================
+      - name: Create changeset (not dev dep)
+        run: .github/workflows/dependabot_auto_merge_changeset.sh
+        if: ${{ steps.metadata.outputs.update-type != 'version-update:semver-major' && steps.metadata.outputs.dependency-type != 'direct:development' }}
+        env:
+          DEPENDENCIES: ${{ steps.metadata.outputs.dependency-names }}
+          GITHUB_TOKEN: ${{ secrets.SHOPIFY_GH_ACCESS_TOKEN }}  # ← elevated PAT in env
+
+      - name: Enable auto-merge for Dependabot PRs
+        if: ${{ steps.metadata.outputs.update-type != 'version-update:semver-major' }}
+        run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.SHOPIFY_GH_ACCESS_TOKEN }}
